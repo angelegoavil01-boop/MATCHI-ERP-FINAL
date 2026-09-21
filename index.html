@@ -264,6 +264,7 @@ label.fld.req>span::after{content:" *";color:var(--coral)}
   .wrap{padding:14px 12px 72px}
 }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 </head>
 <body>
 
@@ -298,6 +299,12 @@ label.fld.req>span::after{content:" *";color:var(--coral)}
    Fuente única de verdad: state.po[] + state.so[]
    Todo lo demás (stock, kardex, KPIs) se deriva en cada render.
    ============================================================ */
+
+const SUPABASE_URL = 'https://hbogmsnwsplxtnlaoine.supabase.co';
+const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_JYxDOr8OWC9LCPIkZ0isAw_mmWXuwJt';
+const ERP_STATE_ID = 'main';
+
+let realtimeChannel = null;
 
 const CFG = {
   material:'MATCHA-100G', materialTxt:'MATCHA POWDER 100G', uom:'POUCH',
@@ -448,21 +455,132 @@ function returnSO(id,date,reason){
 }
 
 /* ---------- persistencia ---------- */
-async function connect(){ backend=null; /* build independiente: solo almacenamiento local */ }
+async function connect(){
+  backend=null;
+
+  try{
+    backend=window.supabase.createClient(
+      SUPABASE_URL,
+      SUPABASE_PUBLISHABLE_KEY,
+      {
+        auth:{
+          persistSession:true,
+          autoRefreshToken:true,
+          detectSessionInUrl:true
+        }
+      }
+    );
+
+    const {data:{user},error}=await backend.auth.getUser();
+    if(error||!user){
+      backend=null;
+      return false;
+    }
+
+    if(realtimeChannel){
+      try{await backend.removeChannel(realtimeChannel)}catch(e){}
+    }
+
+    realtimeChannel=backend
+      .channel('matchi-erp-state')
+      .on(
+        'postgres_changes',
+        {event:'*',schema:'public',table:'erp_state',filter:'id=eq.'+ERP_STATE_ID},
+        payload=>{
+          const data=payload.new&&payload.new.data;
+          if(!data||!data.po||!data.so)return;
+
+          state=data;
+          if(state.params)Object.assign(CFG,state.params);
+
+          try{localStorage.setItem('matchi-erp-v1',JSON.stringify(state))}catch(e){}
+          render();
+        }
+      )
+      .subscribe();
+
+    return true;
+  }catch(e){
+    console.error('Supabase connect:',e);
+    backend=null;
+    return false;
+  }
+}
+
 async function load(){
   try{
     if(backend){
-      const d=await backend.doc('erp/state').get();
-      const data=d&&(d.data||d.value||d);
-      if(data&&data.po&&data.so)return data;
+      const {data,error}=await backend
+        .from('erp_state')
+        .select('data')
+        .eq('id',ERP_STATE_ID)
+        .maybeSingle();
+
+      if(error)throw error;
+      if(data&&data.data&&data.data.po&&data.data.so){
+        try{localStorage.setItem('matchi-erp-v1',JSON.stringify(data.data))}catch(e){}
+        return data.data;
+      }
+    }
+  }catch(e){
+    console.error('Supabase load:',e);
+  }
+
+  let initial=null;
+
+  try{
+    const raw=localStorage.getItem('matchi-erp-v1');
+    if(raw){
+      const d=JSON.parse(raw);
+      if(d&&d.po&&d.so)initial=d;
     }
   }catch(e){}
-  try{const raw=localStorage.getItem('matchi-erp-v1');if(raw){const d=JSON.parse(raw);if(d&&d.po)return d}}catch(e){}
-  return JSON.parse(JSON.stringify(SEED));
+
+  if(!initial)initial=JSON.parse(JSON.stringify(SEED));
+
+  if(backend){
+    try{
+      const {data:{user}}=await backend.auth.getUser();
+      const {error}=await backend
+        .from('erp_state')
+        .upsert({
+          id:ERP_STATE_ID,
+          data:initial,
+          updated_at:new Date().toISOString(),
+          updated_by:user?user.id:null
+        },{onConflict:'id'});
+
+      if(error)throw error;
+    }catch(e){
+      console.error('Supabase initial save:',e);
+    }
+  }
+
+  return initial;
 }
+
 async function save(){
   try{localStorage.setItem('matchi-erp-v1',JSON.stringify(state))}catch(e){}
-  try{if(backend)await backend.doc('erp/state').set(JSON.parse(JSON.stringify(state)))}catch(e){}
+
+  if(!backend)return;
+
+  try{
+    const {data:{user}}=await backend.auth.getUser();
+
+    const {error}=await backend
+      .from('erp_state')
+      .upsert({
+        id:ERP_STATE_ID,
+        data:JSON.parse(JSON.stringify(state)),
+        updated_at:new Date().toISOString(),
+        updated_by:user?user.id:null
+      },{onConflict:'id'});
+
+    if(error)throw error;
+  }catch(e){
+    console.error('Supabase save:',e);
+    msg('No se pudo sincronizar con la nube. El cambio quedó guardado solo en este navegador.','err');
+  }
 }
 
 /* ---------- mensajes ---------- */
