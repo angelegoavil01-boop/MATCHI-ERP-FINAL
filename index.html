@@ -442,6 +442,29 @@ function fefo(qty,date){
   for(const b of av){ if(rest<=0)break; const t=Math.min(rest,b.free); out.push({batch:b.id,qty:t,cost:b.cost,expiry:b.expiry}); rest-=t;}
   return {alloc:out,short:rest};
 }
+function ownAllocQty(s,batchId){
+  return (s.alloc||[]).filter(a=>a.batch===batchId).reduce((t,a)=>t+Number(a.qty||0),0);
+}
+function availableForOrder(s,b){
+  return Math.max(0,Number(b.free||0)+ownAllocQty(s,b.id));
+}
+function eligibleBatchesForOrder(s,date){
+  const d=date||TODAY;
+  return batches()
+    .filter(b=>b.grDate<=d && b.expiry>=d && availableForOrder(s,b)>0)
+    .sort((a,b)=>a.expiry.localeCompare(b.expiry)||a.grDate.localeCompare(b.grDate));
+}
+function fefoForOrder(s,date){
+  const av=eligibleBatchesForOrder(s,date);
+  const out=[];let rest=Number(s.qty||0);
+  for(const b of av){
+    if(rest<=0)break;
+    const t=Math.min(rest,availableForOrder(s,b));
+    if(t>0)out.push({batch:b.id,qty:t,cost:b.cost,expiry:b.expiry});
+    rest-=t;
+  }
+  return {alloc:out,short:rest};
+}
 function soCost(s){return s.alloc.reduce((t,a)=>{const b=batchById(a.batch);return t+a.qty*(b?b.cost:0)},0)}
 function soNet(s){return s.qty*s.price-(s.discount||0)}
 function soMargin(s){return s.status==='Entregado' ? soNet(s)-soCost(s)-(s.freight||0) : 0}
@@ -528,8 +551,12 @@ function showLogin(message){
   const g=document.getElementById('authGate');
   if(g)g.classList.remove('hidden');
   setCloudStatus('SIN SESIÓN');
-  if(message)setAuthMsg(message);
-  setTimeout(()=>{const e=document.getElementById('authEmail');if(e)e.focus()},0);
+  const email=document.getElementById('authEmail');
+  const pass=document.getElementById('authPassword');
+  if(email)email.value='';
+  if(pass)pass.value='';
+  setAuthMsg(message||'Ingresa tus credenciales para iniciar una nueva sesión.');
+  setTimeout(()=>{if(email)email.focus()},0);
 }
 function hideLogin(){
   document.body.classList.remove('auth-locked');
@@ -602,9 +629,9 @@ async function connect(){
         SUPABASE_PUBLISHABLE_KEY,
         {
           auth:{
-            persistSession:true,
+            persistSession:false,
             autoRefreshToken:true,
-            detectSessionInUrl:true
+            detectSessionInUrl:false
           }
         }
       );
@@ -617,7 +644,7 @@ async function connect(){
           currentProfile=null;
           appBooted=false;
           stopRealtime();
-          showLogin('Sesión cerrada. Inicia sesión para continuar.');
+          showLogin('Sesión cerrada. Ingresa nuevamente tus credenciales.');
         }
         if(event==='TOKEN_REFRESHED'&&session?.user){
           currentUser=session.user;
@@ -626,16 +653,14 @@ async function connect(){
       authSubscription=data&&data.subscription;
     }
 
-    const {data:{session},error}=await backend.auth.getSession();
-    if(error)throw error;
-    if(!session||!session.user){
-      currentUser=null;
-      showLogin();
-      return null;
-    }
-
-    currentUser=session.user;
-    return currentUser;
+    /* Seguridad solicitada: cada carga/entrada al ERP comienza bloqueada.
+       La sesión NO se recupera desde caché ni localStorage. */
+    currentUser=null;
+    currentProfile=null;
+    appBooted=false;
+    await stopRealtime();
+    showLogin('Ingresa tus credenciales para iniciar una nueva sesión.');
+    return null;
   }catch(e){
     console.error('Supabase connect:',e);
     setCloudStatus('ERROR');
@@ -788,6 +813,16 @@ function wireAuthUI(){
     if(n)n.addEventListener('keydown',e=>{if(e.key==='Enter')loginERP()});
   });
 }
+
+window.addEventListener('pageshow',event=>{
+  if(event.persisted){
+    currentUser=null;
+    currentProfile=null;
+    appBooted=false;
+    stopRealtime();
+    showLogin('Por seguridad, vuelve a ingresar tus credenciales.');
+  }
+});
 
 /* ---------- mensajes ---------- */
 let msgT=null;
@@ -1141,27 +1176,43 @@ function va02(){
 function vl01n(){
   const open=openSO();
   if(!open.length)return head('VL01N')+`<div class="card"><div class="empty">No hay pedidos pendientes de despacho.<br><br><button class="btn" data-go="VA01">Crear un pedido</button></div></div>`;
-  return head('VL01N','Contabilizar la salida es lo que descuenta stock, fija el costo real y reconoce el margen.')+
+  return head('VL01N','FEFO se recomienda por defecto. Antes de contabilizar puedes cambiar manualmente los lotes y cantidades; el stock recién se descuenta con la salida.')+
   open.map(s=>{
     const short=s.alloc.reduce((t,a)=>t+a.qty,0)<s.qty;
+    const lotes=eligibleBatchesForOrder(s,TODAY);
+    const assigned=s.alloc.reduce((t,a)=>t+Number(a.qty||0),0);
     return `<div class="card">
     <header><h4 class="mono">${s.id}</h4><span class="pill warn">Pendiente</span>
     <span class="hint">${esc(s.customer)} · ${esc(s.district||'—')} · ${N(s.qty)} pouch · ${fdate(s.date)}</span></header>
     <div class="body">
-      ${short?'<div class="note bad"><b>Pedido incompleto:</b> no hay lote asignado para toda la cantidad. Recibe stock con MIGO y vuelve a determinar.</div>':''}
-      <div class="tablescroll"><table><thead><tr><th>Lote</th><th>Vence</th><th class="num">A despachar</th><th class="num">Costo</th></tr></thead><tbody>
-      ${s.alloc.map(a=>{const b=batchById(a.batch);return `<tr><td class="mono">${a.batch}</td><td>${b?fdate(b.expiry):''}</td><td class="num">${N(a.qty)}</td><td class="num">${S(a.qty*(b?b.cost:0))}</td></tr>`}).join('')||'<tr><td colspan="4" class="empty">Sin lote determinado</td></tr>'}
+      ${short?'<div class="note bad"><b>Pedido incompleto:</b> no hay lote asignado para toda la cantidad. Puedes recibir stock con MIGO o completar la asignación manual.</div>':''}
+      <div class="note"><b>Recomendación:</b> el sistema mantiene FEFO por defecto (vence antes, sale antes). Puedes modificar la cantidad de cada lote antes de contabilizar la salida.</div>
+      <div class="tablescroll"><table><thead><tr><th>Prioridad</th><th>Lote</th><th>Vence</th><th class="num">Disponible*</th><th class="num">Cantidad a despachar</th><th class="num">Costo unit.</th></tr></thead><tbody>
+      ${lotes.map((b,i)=>{
+        const own=ownAllocQty(s,b.id), max=availableForOrder(s,b);
+        return `<tr>
+          <td>${i===0?'<span class="pill ok">FEFO 1</span>':'FEFO '+(i+1)}</td>
+          <td class="mono">${b.id}</td><td>${fdate(b.expiry)}</td>
+          <td class="num">${N(max)}</td>
+          <td class="num"><input type="number" min="0" max="${max}" step="1" value="${own}" data-lotqty="${s.id}" data-lot="${b.id}" style="width:86px;text-align:right"></td>
+          <td class="num">${S(b.cost)}</td>
+        </tr>`;
+      }).join('')||'<tr><td colspan="6" class="empty">No hay lotes vigentes disponibles.</td></tr>'}
       </tbody></table></div>
+      <div class="hint" style="margin-top:8px">* Disponible considera el stock libre más la cantidad ya reservada por este mismo pedido.</div>
+      <div class="note" id="lotsum-${s.id}" style="margin-top:10px"><b>Asignado:</b> ${N(assigned)} / ${N(s.qty)} pouch</div>
       <div class="formgrid" style="margin-top:14px">
         <label class="fld"><span>Fecha de salida de mercancía</span><input type="date" value="${TODAY}" data-gid="${s.id}"></label>
       </div>
     </div>
     <div class="actions">
+      <button class="btn" data-apply-lots="${s.id}">Aplicar lotes seleccionados</button>
+      <button class="btn" data-redet="${s.id}">Restaurar recomendación FEFO</button>
       <button class="btn primary" data-gi="${s.id}" ${short?'disabled':''}>Contabilizar salida</button>
-      <button class="btn" data-redet="${s.id}">Redeterminar lote</button>
       <button class="btn ghost" data-go="VA02" data-preso="${s.id}" style="color:var(--red)">Anular pedido</button>
     </div></div>`}).join('');
 }
+
 /* ---------------- VL06O ---------------- */
 function vl06o(){
   const rows=state.so.filter(s=>s.status==='Entregado').sort((a,b)=>b.dlDoc.localeCompare(a.dlDoc)).map(s=>`<tr>
@@ -1688,11 +1739,48 @@ function bind(){
     go('VL01N');
   };
 
-  document.querySelectorAll('[data-redet]').forEach(b=>b.onclick=()=>{
+  const updateLotSum=id=>{
+    const s=state.so.find(x=>x.id===id);if(!s)return;
+    const total=[...document.querySelectorAll('[data-lotqty="'+id+'"]')]
+      .reduce((t,n)=>t+Math.max(0,Number(n.value||0)),0);
+    const box=el('lotsum-'+id);
+    if(box){
+      box.innerHTML='<b>Asignado:</b> '+N(total)+' / '+N(s.qty)+' pouch';
+      box.classList.toggle('bad',Math.abs(total-s.qty)>.0001);
+    }
+  };
+  document.querySelectorAll('[data-lotqty]').forEach(n=>n.oninput=()=>updateLotSum(n.dataset.lotqty));
+
+  document.querySelectorAll('[data-apply-lots]').forEach(b=>b.onclick=async()=>{
+    const s=state.so.find(x=>x.id===b.dataset.applyLots);if(!s)return;
+    const inputs=[...document.querySelectorAll('[data-lotqty="'+s.id+'"]')];
+    const alloc=[];let total=0;
+    for(const n of inputs){
+      const q=Math.max(0,Number(n.value||0));
+      if(q<=0)continue;
+      const bt=batchById(n.dataset.lot);
+      if(!bt)return msg('El lote '+n.dataset.lot+' ya no existe. Actualiza la pantalla.','err');
+      const max=availableForOrder(s,bt);
+      if(q>max+.0001)return msg('El lote '+bt.id+' solo tiene '+N(max)+' pouch disponibles para este pedido.','err');
+      alloc.push({batch:bt.id,qty:q});total+=q;
+    }
+    if(Math.abs(total-s.qty)>.0001)return msg('Debes asignar exactamente '+N(s.qty)+' pouch. Actualmente asignaste '+N(total)+'.','err');
+    const previous=JSON.parse(JSON.stringify(s.alloc||[]));
+    s.alloc=alloc;
+    const ok=await save();
+    if(!ok){s.alloc=previous;return}
+    msg('Asignación de lotes actualizada para <b>'+s.id+'</b>. Puedes contabilizar la salida.');
+    render();
+  });
+
+  document.querySelectorAll('[data-redet]').forEach(b=>b.onclick=async()=>{
     const s=state.so.find(x=>x.id===b.dataset.redet);
-    const r=fefo(s.qty,s.date>TODAY?s.date:TODAY);
+    const r=fefoForOrder(s,s.date>TODAY?s.date:TODAY);
+    const previous=JSON.parse(JSON.stringify(s.alloc||[]));
     s.alloc=r.alloc.map(a=>({batch:a.batch,qty:a.qty}));
-    save();msg(r.short>0?'Aún faltan '+N(r.short)+' pouch de stock libre.':'Lote redeterminado por FEFO.',r.short>0?'err':'');
+    const ok=await save();
+    if(!ok){s.alloc=previous;return}
+    msg(r.short>0?'Aún faltan '+N(r.short)+' pouch de stock libre.':'Recomendación FEFO restaurada.',r.short>0?'err':'');
     render();
   });
 
@@ -1761,12 +1849,8 @@ function bind(){
   state=JSON.parse(JSON.stringify(SEED));
   render();
 
-  const user=await connect();
-  if(user){
-    await activateCloudSession(user);
-  }else{
-    showLogin();
-  }
+  await connect();
+  showLogin('Ingresa tus credenciales para iniciar una nueva sesión.');
 })();
 </script>
 </body>
